@@ -20,22 +20,38 @@ namespace HttpBench
     /// </summary>
     sealed class InMemoryListenerFactory : IConnectionListenerFactory
     {
-        readonly Channel<AcceptRequest> _acceptRequests = Channel.CreateUnbounded<AcceptRequest>();
+        readonly Channel<TaskCompletionSource<ConnectionContext>> _acceptRequests = Channel.CreateUnbounded<TaskCompletionSource<ConnectionContext>>();
 
         public async ValueTask<DuplexPipeStream> ConnectClientAsync(string host, int port, CancellationToken cancellationToken = default)
         {
-            AcceptRequest accept = await _acceptRequests.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
-
             var ctx = new InMemoryConnectionContext();
-            accept.CompletionSource.SetResult(ctx);
-            return ctx.ClientTransport;
+
+            while (true)
+            {
+                if (!await _acceptRequests.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    throw new TaskCanceledException($"The {nameof(InMemoryListenerFactory)} was disposed.");
+                }
+
+                while (_acceptRequests.Reader.TryRead(out TaskCompletionSource<ConnectionContext> accept))
+                {
+                    if (accept.TrySetResult(ctx))
+                    {
+                        return ctx.ClientTransport;
+                    }
+                }
+            }
         }
 
         private async ValueTask<ConnectionContext> AcceptAsync(CancellationToken cancellationToken)
         {
-            var acceptRequest = new AcceptRequest(cancellationToken);
-            await _acceptRequests.Writer.WriteAsync(acceptRequest, cancellationToken).ConfigureAwait(false);
-            return await acceptRequest.CompletionSource.Task.ConfigureAwait(false);
+            var acceptRequest = new TaskCompletionSource<ConnectionContext>(TaskContinuationOptions.RunContinuationsAsynchronously);
+
+            using (cancellationToken.UnsafeRegister(_ => { acceptRequest.TrySetCanceled(cancellationToken); }, null))
+            {
+                await _acceptRequests.Writer.WriteAsync(acceptRequest, cancellationToken).ConfigureAwait(false);
+                return await acceptRequest.Task.ConfigureAwait(false);
+            }
         }
 
         public ValueTask<IConnectionListener> BindAsync(EndPoint endpoint, CancellationToken cancellationToken = default)
@@ -46,27 +62,47 @@ namespace HttpBench
 
         private sealed class InMemoryListener : IConnectionListener
         {
+            readonly CancellationTokenSource _cancellationTokenSource;
             readonly InMemoryListenerFactory _factory;
             public EndPoint EndPoint { get; }
 
             public InMemoryListener(InMemoryListenerFactory factory, EndPoint endPoint)
             {
+                _cancellationTokenSource = new CancellationTokenSource();
                 _factory = factory;
                 EndPoint = endPoint;
             }
 
-            public ValueTask<ConnectionContext> AcceptAsync(CancellationToken cancellationToken = default)
+            public async ValueTask<ConnectionContext> AcceptAsync(CancellationToken cancellationToken = default)
             {
-                return _factory.AcceptAsync(cancellationToken);
+                if (_cancellationTokenSource.IsCancellationRequested)
+                {
+                    return null;
+                }
+
+                using (CancellationTokenSource src = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cancellationTokenSource.Token))
+                {
+                    try
+                    {
+                        return await _factory.AcceptAsync(src.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException ex) when (ex.CancellationToken == src.Token && !cancellationToken.IsCancellationRequested)
+                    {
+                        return null;
+                    }
+                }
             }
 
             public ValueTask DisposeAsync()
             {
+                _cancellationTokenSource.Cancel();
+                _cancellationTokenSource.Dispose();
                 return default;
             }
 
             public ValueTask UnbindAsync(CancellationToken cancellationToken = default)
             {
+                _cancellationTokenSource.Cancel();
                 return default;
             }
         }
@@ -163,28 +199,6 @@ namespace HttpBench
             IEnumerator IEnumerable.GetEnumerator()
             {
                 return ((IEnumerable<KeyValuePair<Type, object>>)this).GetEnumerator();
-            }
-        }
-
-        private sealed class ConnectRequest
-        {
-            public CancellationToken Token { get; }
-            public TaskCompletionSource<DuplexPipeStream> CompletionSource { get; } = new TaskCompletionSource<DuplexPipeStream>();
-
-            public ConnectRequest(CancellationToken token)
-            {
-                Token = token;
-            }
-        }
-
-        private sealed class AcceptRequest
-        {
-            public CancellationToken Token { get; }
-            public TaskCompletionSource<ConnectionContext> CompletionSource { get; } = new TaskCompletionSource<ConnectionContext>();
-
-            public AcceptRequest(CancellationToken token)
-            {
-                Token = token;
             }
         }
     }

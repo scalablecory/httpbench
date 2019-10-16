@@ -23,11 +23,31 @@ namespace HttpBench
 {
     public class Program
     {
+        const string ListenRoute = "/google.pubsub.v2.PublisherService/CreateTopic";
         const string ListenHost = "localhost";
         const int ListenPort = 54321;
 
-        readonly HttpClient _client;
-        readonly IWebHost _webHost;
+        Uri _endpointUri;
+        InMemoryListenerFactory _listenerFactory;
+        HttpClient _client;
+        IWebHost _webHost;
+
+        [GlobalSetup]
+        public void Setup()
+        {
+            _endpointUri = new Uri(new Uri($"https://{ListenHost}:{ListenPort}/"), ListenRoute);
+            _listenerFactory = new InMemoryListenerFactory();
+            _client = CreateHttpClient(_listenerFactory);
+            _webHost = CreateWebHost(_listenerFactory);
+            _webHost.Start();
+        }
+
+        [GlobalCleanup]
+        public void Cleanup()
+        {
+            _client.Dispose();
+            _webHost.Dispose();
+        }
 
         [Benchmark]
         public async Task GetSimple()
@@ -35,20 +55,11 @@ namespace HttpBench
             using HttpRequestMessage req = new HttpRequestMessage();
 
             req.Method = HttpMethod.Post;
-            req.RequestUri = new Uri("/", UriKind.Relative);
             req.Version = HttpVersion.Version20;
-            req.Content = new StringContent("asdf", Encoding.ASCII, "text/plain");
-            req.Headers.Add("x-test-foo", "some huffman-coded value");
+            req.RequestUri = _endpointUri;
+            req.Content = new StringContent("asdf", Encoding.ASCII, "application/grpc+proto");
 
             using HttpResponseMessage res = await _client.SendAsync(req).ConfigureAwait(false);
-        }
-
-        public Program()
-        {
-            var listenerFactory = new InMemoryListenerFactory();
-            _client = CreateHttpClient(listenerFactory);
-            _webHost = CreateWebHost(listenerFactory);
-            _webHost.Start();
         }
 
         static HttpClient CreateHttpClient(InMemoryListenerFactory listenerFactory)
@@ -62,10 +73,12 @@ namespace HttpBench
             handler.GetType().GetProperty("ConnectCallback").SetValue(handler, dialer);
             handler.SslOptions.RemoteCertificateValidationCallback = delegate { return true; };
 
-            return new HttpClient(handler)
-            {
-                BaseAddress = new Uri($"https://{ListenHost}:{ListenPort}/")
-            };
+            var client = new HttpClient(handler);
+            client.DefaultRequestHeaders.TryAddWithoutValidation("grpc-timeout", "15");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("grpc-encoding", "gzip");
+            client.DefaultRequestHeaders.TryAddWithoutValidation("authorization", "Bearer y235.wef315yfh138vh31hv93hv8h3v");
+
+            return client;
         }
 
         static IWebHost CreateWebHost(InMemoryListenerFactory listenerFactory)
@@ -87,13 +100,13 @@ namespace HttpBench
                 .ConfigureLogging(logging =>
                 {
                     logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+                    //logging.AddFilter("Microsoft.AspNetCore", LogLevel.Trace);
                 })
                 .Configure(app =>
                 {
-                    app.UseRouting();
-                    app.UseEndpoints(routes =>
+                    app.UseRouting().UseEndpoints(routes =>
                     {
-                        routes.MapPost("/", async ctx =>
+                        routes.MapPost(ListenRoute, async ctx =>
                         {
                             await ctx.Response.WriteAsync("ok").ConfigureAwait(false);
                         });
@@ -124,8 +137,11 @@ namespace HttpBench
 
             Program p = new Program();
 
+            p.Setup();
             //p.GetSimple().GetAwaiter().GetResult();
             PoorMansBenchmark(() => p.GetSimple().Wait());
+            p.Cleanup();
+
             //BenchmarkRunner.Run<Program>();
         }
 
